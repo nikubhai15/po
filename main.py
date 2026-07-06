@@ -964,7 +964,7 @@ async def shopify_check(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid cc format. Use cc|mm|yy|cvv")
 
-    # CHANGE: Use concurrent version (no await)
+    # CHANGE: Use concurrent version (remove await)
     result = run_concurrent_checkout(url, cc_num, month, year, cvv, proxy, solver, solver_key)
 
     if result["Response"] in ("ERROR", "EXCEPTION"):
@@ -1008,6 +1008,7 @@ async def shopify_check(
 
     return clean_result
 
+
 # ──────────────────────── Concurrency Engine ────────────────────────
 import threading
 
@@ -1039,7 +1040,8 @@ def run_concurrent_checkout(site_url, cc, month, year, cvv, proxy=None, solver=N
         _throttled_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key),
         loop
     )
-    return future.result(timeout=60)
+    return future.result(timeout=120)
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -1053,6 +1055,8 @@ async def shutdown_event():
         _loop.call_soon_threadsafe(_loop.stop)
         _loop.close()
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
     uvicorn.run(app, host="0.0.0.0", port=port)

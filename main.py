@@ -964,7 +964,8 @@ async def shopify_check(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid cc format. Use cc|mm|yy|cvv")
 
-    result = await run_shopify_checkout(url, cc_num, month, year, cvv, proxy, solver, solver_key)
+    # CHANGE: Use concurrent version (no await)
+    result = run_concurrent_checkout(url, cc_num, month, year, cvv, proxy, solver, solver_key)
 
     if result["Response"] in ("ERROR", "EXCEPTION"):
         raise HTTPException(status_code=500, detail=result)
@@ -1007,6 +1008,50 @@ async def shopify_check(
 
     return clean_result
 
+# ──────────────────────── Concurrency Engine ────────────────────────
+import threading
+
+MAX_CONCURRENT = 200
+_loop = None
+_loop_thread = None
+_semaphore = None
+
+def _start_background_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def get_event_loop():
+    global _loop, _loop_thread, _semaphore
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
+        _loop_thread.start()
+    return _loop
+
+async def _throttled_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key):
+    async with _semaphore:
+        return await run_shopify_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key)
+
+def run_concurrent_checkout(site_url, cc, month, year, cvv, proxy=None, solver=None, solver_key=None):
+    loop = get_event_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _throttled_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key),
+        loop
+    )
+    return future.result(timeout=60)
+
+@app.on_event("startup")
+async def startup_event():
+    get_event_loop()
+    print(f"🚀 Concurrency engine started (max {MAX_CONCURRENT})")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _loop
+    if _loop and not _loop.is_closed():
+        _loop.call_soon_threadsafe(_loop.stop)
+        _loop.close()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

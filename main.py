@@ -849,7 +849,7 @@ Channel: syncchats.t.me
                     r_typename = receipt.get('__typename')
                     if r_typename == 'ActionRequiredReceipt':
                         print(f"\033[92m✅ 3DS - Action Required (from submit response)\033[0m")
-                        result["Response"] = "OTP"
+                        result["Response"] = "OTP_REQUIRED"
                         result["details"]["message"] = "3DS - Action Required"
                         action = receipt.get('action')
                         if action and action.get('offsiteRedirect'):
@@ -976,7 +976,7 @@ async def shopify_check(
         "Price": result["Price"],
         "Gate": result["Gate"],
         "Site": result["Site"],
-        "t.me": "@xaed3n"
+        "t.me": "@NIKSHACKS"
     }
 
     # If it's a decline and we have a specific error code, use it unless it's CAPTCHA_REQUIRED

